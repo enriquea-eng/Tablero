@@ -4,8 +4,8 @@ import plotly.express as px
 import pandas as pd
 import io
 import html as html_lib
-from datetime import datetime, date, timedelta
-from data import get_shipping_data
+from datetime import datetime, date, timedelta, timezone
+from data import get_shipping_data, get_entradas_por_hora, get_ordenes_pickup
 
 st.set_page_config(page_title="Tablero de Envíos", layout="wide")
 
@@ -67,14 +67,48 @@ def tabla_conteo_html(serie, nombre_columna):
     """
 
 
-def construir_excel(detalle_df, columnas_detalle):
-    """Arma un Excel con el detalle y los desgloses por método y transportadora."""
+def _formatear_horas_locales(df, columnas=("hora_creacion", "hora_limite", "hora_despacho")):
+    """Convierte columnas de datetime con zona horaria mixta (una por fila,
+    según el país de la orden) a texto legible en SU hora local.
+
+    Streamlit/pyarrow no soportan una columna con offsets de zona horaria
+    distintos por fila: al serializarla para mostrarla, le pegan a todas las
+    filas el offset de la primera que encuentran (una orden de México puede
+    terminar mostrando "-05:00" de Colombia). El valor de fondo sigue siendo
+    el instante correcto; solo la etiqueta se ve mal. Por eso, justo antes
+    de mostrar o exportar, se convierte cada celda a texto ya en su propia
+    hora local — así no hay ambigüedad de zona horaria que serializar.
+    """
+    df = df.copy()
+    for col in columnas:
+        if col in df.columns:
+            df[col] = df[col].apply(lambda t: t.strftime("%Y-%m-%d %H:%M") if pd.notna(t) else None)
+    return df
+
+
+def _sin_zona_horaria(valor):
+    """Excel no soporta datetimes con zona horaria; quitamos el tzinfo justo
+    antes de exportar (las horas ya están en la hora local correcta, solo
+    se pierde la etiqueta de zona)."""
+    if isinstance(valor, pd.Timestamp) and valor.tzinfo is not None:
+        return valor.tz_localize(None)
+    return valor
+
+
+def construir_excel(detalle_df, columnas_detalle, incluir_metodo=True):
+    """Arma un Excel con el detalle y los desgloses solicitados."""
+    detalle_df = detalle_df.copy()
+    for col in ("hora_creacion", "hora_limite", "hora_despacho"):
+        if col in detalle_df.columns:
+            detalle_df[col] = detalle_df[col].map(_sin_zona_horaria)
+
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         detalle_df[columnas_detalle].to_excel(writer, sheet_name="Detalle", index=False)
-        detalle_df["metodo_envio"].value_counts().rename("cantidad").to_frame().to_excel(
-            writer, sheet_name="Por metodo de envio"
-        )
+        if incluir_metodo:
+            detalle_df["metodo_envio"].value_counts().rename("cantidad").to_frame().to_excel(
+                writer, sheet_name="Por metodo de envio"
+            )
         detalle_df["transportadora"].fillna("Sin transportadora").value_counts().rename(
             "cantidad"
         ).to_frame().to_excel(writer, sheet_name="Por transportadora")
@@ -114,10 +148,15 @@ def barra_horizontal(serie, color="#7C4DFF"):
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
 if "data" not in st.session_state:
-    st.session_state.data = get_shipping_data()
+    with st.spinner("Cargando datos..."):
+        st.session_state.data = get_shipping_data()
+        st.session_state.entradas = get_entradas_por_hora()
+        st.session_state.pickup = get_ordenes_pickup()
     st.session_state.ultima_actualizacion = datetime.now()
 
 df = st.session_state.data
+entradas = st.session_state.entradas
+pickup = st.session_state.pickup
 
 # =========================================================
 # ENCABEZADO
@@ -134,9 +173,17 @@ with col_fecha:
 with col_boton:
     st.write("")  # separación vertical
     if st.button("🔄 Actualizar", use_container_width=True):
-        st.session_state.data = get_shipping_data()
+        # Sin más código después de esto (nada de st.rerun()): un clic de
+        # botón ya provoca su propia vuelta completa del script. Si se corta
+        # la ejecución aquí con st.rerun(), el script nunca llega a crear los
+        # selectbox de filtros más abajo en ESTA vuelta, y Streamlit borra el
+        # estado de cualquier widget con key que no se haya instanciado —
+        # así es como los filtros (filtro_pais/cedi/seller) se resetean solos.
+        with st.spinner("Actualizando..."):
+            st.session_state.data = get_shipping_data()
+            st.session_state.entradas = get_entradas_por_hora()
+            st.session_state.pickup = get_ordenes_pickup()
         st.session_state.ultima_actualizacion = datetime.now()
-        st.rerun()
 
 st.divider()
 
@@ -166,12 +213,20 @@ with f4:
 
 # --- Aplicar filtros ---
 df_filtrado = df.copy()
+entradas_filtrado = entradas.copy()
+pickup_filtrado = pickup.copy()
 if pais_sel != "Todos":
     df_filtrado = df_filtrado[df_filtrado["pais"] == pais_sel]
+    entradas_filtrado = entradas_filtrado[entradas_filtrado["pais"] == pais_sel]
+    pickup_filtrado = pickup_filtrado[pickup_filtrado["pais"] == pais_sel]
 if cedi_sel != "Todos":
     df_filtrado = df_filtrado[df_filtrado["cedi"] == cedi_sel]
+    entradas_filtrado = entradas_filtrado[entradas_filtrado["cedi"] == cedi_sel]
+    pickup_filtrado = pickup_filtrado[pickup_filtrado["cedi"] == cedi_sel]
 if seller_sel != "Todos":
     df_filtrado = df_filtrado[df_filtrado["seller"] == seller_sel]
+    entradas_filtrado = entradas_filtrado[entradas_filtrado["seller"] == seller_sel]
+    pickup_filtrado = pickup_filtrado[pickup_filtrado["seller"] == seller_sel]
 
 st.divider()
 
@@ -180,7 +235,12 @@ pendientes = df_filtrado[df_filtrado["ubicacion"] != "Despachado"]
 despachados = df_filtrado[df_filtrado["ubicacion"] == "Despachado"]
 
 # --- Cálculos de cumplimiento / SLA, usados en varias secciones ---
-ahora = datetime.now()
+# hora_limite/hora_despacho vienen de data.py ya con zona horaria (tz-aware,
+# en la hora local de cada bodega: México, Colombia y Chile no comparten
+# huso horario). "ahora" tiene que ser tz-aware también -si fuera
+# datetime.now() a secas, pandas comparar naive contra aware truena, y si
+# se comparara mal el desfase sería de 3 a 6 horas según el país.
+ahora = datetime.now(timezone.utc)
 ventana_urgente = timedelta(hours=2)
 
 total_programadas = len(df_filtrado)
@@ -201,12 +261,24 @@ if len(despachadas_tarde) > 0:
     despachadas_tarde["motivo"] = "Se despachó fuera de tiempo"
 incumplidas = pd.concat([vencidas, despachadas_tarde], ignore_index=True)
 
+# --- A partir de aquí ya no se hace ningún cálculo con estas horas, solo se
+# muestran/exportan: se convierten a texto en su propia hora local (ver
+# _formatear_horas_locales). ---
+df_filtrado = _formatear_horas_locales(df_filtrado)
+pendientes = _formatear_horas_locales(pendientes)
+despachados = _formatear_horas_locales(despachados)
+vencidas = _formatear_horas_locales(vencidas)
+urgentes = _formatear_horas_locales(urgentes)
+incumplidas = _formatear_horas_locales(incumplidas)
+
 # =========================================================
 # ALERTAS
 # =========================================================
 st.header("🔔 Alertas")
 
-columnas_alerta = ["paquete_id", "cedi", "metodo_envio", "transportadora", "ubicacion", "hora_limite"]
+columnas_alerta = [
+    "paquete_id", "cedi", "seller", "metodo_envio", "transportadora", "ubicacion", "ubicacion_fisica", "hora_limite",
+]
 
 if len(vencidas) > 0:
     st.error(f"🚨 {len(vencidas)} órdenes VENCIDAS: ya debieron salir y siguen sin despachar")
@@ -229,10 +301,27 @@ st.divider()
 # =========================================================
 st.header("Resumen general")
 
+st.caption("Por paquete físico — una orden con varios paquetes cuenta una vez por cada paquete")
 r1, r2, r3 = st.columns(3)
-r1.metric("Órdenes programadas hoy", total_programadas)
-r2.metric("Despachadas", f"{total_despachadas} ({pct_despachadas:.1f}%)")
+r1.metric("Paquetes programados hoy", total_programadas)
+r2.metric("Despachados", f"{total_despachadas} ({pct_despachadas:.1f}%)")
 r3.metric("Pendientes por despachar", f"{total_pendientes} ({pct_pendientes:.1f}%)")
+
+# --- Mismo resumen pero contando ÓRDENES únicas (sell_order.id) en vez de
+# paquetes físicos: una orden con 3 paquetes cuenta 1 vez aquí, no 3. ---
+total_ordenes_programadas = df_filtrado["orden_id"].nunique()
+total_ordenes_despachadas = despachados["orden_id"].nunique()
+total_ordenes_pendientes = pendientes["orden_id"].nunique()
+pct_ordenes_despachadas = (
+    total_ordenes_despachadas / total_ordenes_programadas * 100 if total_ordenes_programadas else 0
+)
+pct_ordenes_pendientes = 100 - pct_ordenes_despachadas if total_ordenes_programadas else 0
+
+st.caption("Por orden — una orden con varios paquetes cuenta una sola vez")
+r4, r5, r6 = st.columns(3)
+r4.metric("Órdenes programadas hoy", total_ordenes_programadas)
+r5.metric("Despachadas", f"{total_ordenes_despachadas} ({pct_ordenes_despachadas:.1f}%)")
+r6.metric("Pendientes por despachar", f"{total_ordenes_pendientes} ({pct_ordenes_pendientes:.1f}%)")
 
 st.divider()
 
@@ -241,62 +330,109 @@ st.divider()
 # =========================================================
 st.header("Por método de envío")
 
-c1, c2, c3, c4 = st.columns(4)
+if len(pendientes) > 0:
+    barra_horizontal(pendientes["metodo_envio"])
 
-mismo_dia = pendientes[pendientes["metodo_envio"] == "Mismo día"]
-siguiente_dia = pendientes[pendientes["metodo_envio"] == "Siguiente día"]
-estandar = pendientes[pendientes["metodo_envio"] == "Estándar"]
-marketplace = pendientes[pendientes["metodo_envio"] == "Marketplace"]
-
-c1.metric("Mismo día", len(mismo_dia))
-c2.metric("Siguiente día", len(siguiente_dia))
-c3.metric("Estándar", len(estandar))
-c4.metric("Marketplace (externo)", len(marketplace))
-
-c5, c6, c7 = st.columns(3)
-
-pickup = pendientes[pendientes["metodo_envio"] == "Pickup"]
-b2b_estandar = pendientes[pendientes["metodo_envio"] == "B2B Estándar"]
-b2b_agendado = pendientes[pendientes["metodo_envio"] == "B2B Envío agendado"]
-
-c5.metric("Pickup (recolección)", len(pickup))
-c6.metric("B2B Estándar", len(b2b_estandar))
-c7.metric("B2B Envío agendado", len(b2b_agendado))
-
-if len(estandar) > 0:
-    with st.expander("Desglose Estándar por transportadora", expanded=True):
-        barra_horizontal(estandar["transportadora"])
-
+marketplace = pendientes[pendientes["marketplace_nombre"].notna()]
 if len(marketplace) > 0:
     with st.expander("Desglose por marketplace", expanded=True):
         barra_horizontal(marketplace["marketplace_nombre"], color="#26C6DA")
 
+transportadora_asignada = pendientes[pendientes["transportadora"].notna()]
+if len(transportadora_asignada) > 0:
+    with st.expander("Desglose por transportadora", expanded=True):
+        barra_horizontal(transportadora_asignada["transportadora"])
+
 st.divider()
 
 # =========================================================
-# ENTRADAS POR HORA - MISMO DÍA
+# ENTRADAS POR HORA - MISMO DÍA / SIGUIENTE DÍA (por país)
 # =========================================================
-st.header("📈 Entradas por hora – Mismo día")
-
-mismo_dia_todas = df_filtrado[df_filtrado["metodo_envio"] == "Mismo día"]
-conteo_horas = (
-    mismo_dia_todas["hora_creacion"].dt.hour.value_counts().reindex(range(24), fill_value=0).sort_index()
+st.header("📈 Entradas por hora – Mismo día vs Siguiente día")
+st.caption(
+    "Cada país usa su propio nombre de método (ej. 'Mismo día hábil local MX' vs "
+    "'... COL' vs '... CL', y variantes como 'Siguiente día hábil local mediano' en "
+    "Tultitlán) — por eso se separa por país en vez de mezclar todo en un solo total."
 )
 
-fig_horas = px.bar(
-    x=[f"{h:02d}:00" for h in conteo_horas.index],
-    y=conteo_horas.values,
-    text=conteo_horas.values,
+COLOR_MISMO_DIA = "#7C4DFF"
+COLOR_SIGUIENTE_DIA = "#FF9800"
+
+mismo_dia_todas = entradas_filtrado[
+    entradas_filtrado["metodo_envio"].str.contains("mismo día", case=False, na=False)
+]
+siguiente_dia_todas = entradas_filtrado[
+    entradas_filtrado["metodo_envio"].str.contains("siguiente día", case=False, na=False)
+]
+
+paises_presentes = sorted(entradas_filtrado["pais"].dropna().unique().tolist())
+columnas_pais = st.columns(len(paises_presentes)) if paises_presentes else []
+for col, pais_actual in zip(columnas_pais, paises_presentes):
+    mismo_dia_pais = (mismo_dia_todas["pais"] == pais_actual).sum()
+    siguiente_dia_pais = (siguiente_dia_todas["pais"] == pais_actual).sum()
+    col.metric(f"{pais_actual} — Mismo día", mismo_dia_pais)
+    col.metric(f"{pais_actual} — Siguiente día", siguiente_dia_pais)
+
+horas_texto = [f"{h:02d}:00" for h in range(24)]
+bloques = []
+for pais_actual in paises_presentes:
+    conteo_mismo_dia = (
+        mismo_dia_todas.loc[mismo_dia_todas["pais"] == pais_actual, "hora_creacion_hora_local"]
+        .value_counts().reindex(range(24), fill_value=0).sort_index()
+    )
+    conteo_siguiente_dia = (
+        siguiente_dia_todas.loc[siguiente_dia_todas["pais"] == pais_actual, "hora_creacion_hora_local"]
+        .value_counts().reindex(range(24), fill_value=0).sort_index()
+    )
+    bloques.append(pd.DataFrame({
+        "hora": horas_texto * 2,
+        "pais": pais_actual,
+        "metodo": ["Mismo día"] * 24 + ["Siguiente día"] * 24,
+        "ordenes": list(conteo_mismo_dia.values) + list(conteo_siguiente_dia.values),
+    }))
+datos_horas = pd.concat(bloques, ignore_index=True) if bloques else pd.DataFrame(
+    columns=["hora", "pais", "metodo", "ordenes"]
 )
-fig_horas.update_traces(marker_color="#7C4DFF", textposition="outside")
-fig_horas.update_layout(
-    xaxis_title=None,
-    yaxis_title="Órdenes",
-    margin=dict(l=0, r=0, t=10, b=0),
-    plot_bgcolor="rgba(0,0,0,0)",
-    paper_bgcolor="rgba(0,0,0,0)",
-)
-st.plotly_chart(fig_horas, use_container_width=True, config={"displayModeBar": False})
+
+if len(datos_horas) > 0:
+    fig_horas = px.bar(
+        datos_horas,
+        x="hora",
+        y="ordenes",
+        color="metodo",
+        barmode="group",
+        facet_col="pais",
+        text="ordenes",
+        color_discrete_map={"Mismo día": COLOR_MISMO_DIA, "Siguiente día": COLOR_SIGUIENTE_DIA},
+    )
+    fig_horas.update_traces(textposition="outside")
+    fig_horas.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
+    fig_horas.update_layout(
+        xaxis_title=None,
+        yaxis_title="Órdenes",
+        legend_title=None,
+        margin=dict(l=0, r=0, t=30, b=0),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    st.plotly_chart(fig_horas, use_container_width=True, config={"displayModeBar": False})
+
+columnas_entradas_detalle = [
+    "orden_numero", "pais", "cedi", "seller", "metodo_envio", "estado", "hora_creacion",
+]
+mismo_dia_detalle = _formatear_horas_locales(mismo_dia_todas, columnas=("hora_creacion",))
+siguiente_dia_detalle = _formatear_horas_locales(siguiente_dia_todas, columnas=("hora_creacion",))
+
+with st.expander(f"Ver detalle — Mismo día ({len(mismo_dia_detalle)})"):
+    st.dataframe(
+        mismo_dia_detalle[columnas_entradas_detalle].sort_values("hora_creacion"),
+        use_container_width=True,
+    )
+with st.expander(f"Ver detalle — Siguiente día ({len(siguiente_dia_detalle)})"):
+    st.dataframe(
+        siguiente_dia_detalle[columnas_entradas_detalle].sort_values("hora_creacion"),
+        use_container_width=True,
+    )
 
 st.divider()
 
@@ -304,20 +440,35 @@ st.divider()
 # POR UBICACIÓN
 # =========================================================
 st.header("Por ubicación")
+st.caption(
+    "Basado en la ubicación física real del paquete (bin/posición en la bodega), "
+    "no en el estado de la orden."
+)
 
 u1, u2, u3 = st.columns(3)
 
-sorting = pendientes[pendientes["ubicacion"] == "Sorting"]
+sorting = pendientes[pendientes["ubicacion_fisica"].str.contains("SORTER", case=False, na=False)]
 en_pendiente = pendientes[
-    (pendientes["ubicacion"] == "Pendiente") & (pendientes["transportadora"].isna())
+    pendientes["ubicacion_fisica"].str.contains("PEN", case=False, na=False)
+    & pendientes["transportadora"].isna()
 ]
 en_estiba = pendientes[
-    (pendientes["ubicacion"] == "Estiba") & (pendientes["transportadora"].isna())
+    pendientes["ubicacion_fisica"].str.contains("ESTIBA", case=False, na=False)
+    & pendientes["transportadora"].isna()
 ]
 
-u1.metric("Sorting", len(sorting))
+u1.metric("SORTER", len(sorting))
 u2.metric("Pendiente (sin transportadora)", len(en_pendiente))
 u3.metric("Estiba (sin transportadora)", len(en_estiba))
+
+with st.expander("Ver detalle"):
+    columnas_ubicacion = ["paquete_id", "cedi", "seller", "metodo_envio", "ubicacion_fisica", "transportadora"]
+    st.write("**SORTER**")
+    st.dataframe(sorting[columnas_ubicacion], use_container_width=True)
+    st.write("**Pendiente (sin transportadora)**")
+    st.dataframe(en_pendiente[columnas_ubicacion], use_container_width=True)
+    st.write("**Estiba (sin transportadora)**")
+    st.dataframe(en_estiba[columnas_ubicacion], use_container_width=True)
 
 st.divider()
 
@@ -338,8 +489,8 @@ st.metric("Total de órdenes incumplidas", len(incumplidas))
 
 if len(incumplidas) > 0:
     columnas_incumplidas = [
-        "paquete_id", "cedi", "metodo_envio", "transportadora",
-        "ubicacion", "hora_limite", "hora_despacho", "motivo",
+        "paquete_id", "cedi", "seller", "metodo_envio", "transportadora",
+        "ubicacion", "ubicacion_fisica", "hora_limite", "hora_despacho", "motivo",
     ]
     st.dataframe(incumplidas[columnas_incumplidas], use_container_width=True)
 else:
@@ -348,15 +499,88 @@ else:
 st.divider()
 
 # =========================================================
+# ÓRDENES PICKUP (recogida en tienda/CEDI)
+# =========================================================
+st.header("📦 Órdenes Pickup")
+st.caption(
+    "Todos los métodos de envío 'Recogida...' (Express, Masiva, B2B, etc.), sin importar cuándo "
+    "se crearon — el objetivo es detectar las que llevan mucho tiempo sin que el cliente pase por ellas."
+)
+
+pickup_detalle = _formatear_horas_locales(
+    pickup_filtrado, columnas=("hora_creacion", "hora_limite_recogida", "hora_recogida")
+)
+
+# --- La vista principal es por ORDEN (una orden puede tener muchos
+# paquetes/cajas físicas — no tiene sentido repetir la misma orden 150
+# veces solo porque se dividió en 150 cajas). El detalle por caja se deja
+# solo en el Excel descargable. ---
+pickup_ordenes = pickup_detalle.groupby("orden_id", as_index=False).agg(
+    orden_numero=("orden_numero", "first"),
+    pais=("pais", "first"),
+    cedi=("cedi", "first"),
+    seller=("seller", "first"),
+    metodo_envio=("metodo_envio", "first"),
+    hora_limite_recogida=("hora_limite_recogida", "first"),
+    hora_recogida=("hora_recogida", "first"),
+    dias_vencido_pickup=("dias_vencido_pickup", "first"),
+    debe_cancelarse=("debe_cancelarse", "first"),
+    cajas=("paquete_id", "count"),
+)
+columnas_pickup_orden = [
+    "orden_numero", "cedi", "seller", "metodo_envio",
+    "hora_limite_recogida", "hora_recogida", "dias_vencido_pickup", "cajas",
+]
+columnas_pickup_cajas = [
+    "paquete_id", "orden_numero", "cedi", "seller", "metodo_envio",
+    "hora_limite_recogida", "hora_recogida", "dias_vencido_pickup",
+]
+
+vencidas_pickup = pickup_ordenes[pickup_ordenes["debe_cancelarse"]]
+
+p1, p2 = st.columns(2)
+p1.metric("Órdenes pickup pendientes", len(pickup_ordenes))
+p2.metric("Vencidas (+15 días, deben cancelarse)", len(vencidas_pickup))
+
+if len(vencidas_pickup) > 0:
+    st.error(
+        f"🚨 {len(vencidas_pickup)} órdenes pickup tienen más de 15 días desde su fecha límite de "
+        "recogida y el cliente no ha pasado por ellas — deben cancelarse por espacio."
+    )
+    with st.expander("Ver órdenes pickup vencidas (+15 días)", expanded=True):
+        st.dataframe(vencidas_pickup[columnas_pickup_orden], use_container_width=True)
+else:
+    st.success("✅ Ninguna orden pickup lleva más de 15 días esperando.")
+
+with st.expander(f"Ver todas las órdenes pickup pendientes ({len(pickup_ordenes)})"):
+    st.dataframe(pickup_ordenes[columnas_pickup_orden], use_container_width=True)
+
+pickup_excel_buffer = io.BytesIO()
+with pd.ExcelWriter(pickup_excel_buffer, engine="openpyxl") as writer:
+    pickup_ordenes[columnas_pickup_orden].to_excel(writer, sheet_name="Ordenes pickup", index=False)
+    pickup_detalle[columnas_pickup_cajas].to_excel(writer, sheet_name="Cajas por orden", index=False)
+pickup_excel_buffer.seek(0)
+st.download_button(
+    "⬇️ Descargar Excel — Órdenes Pickup",
+    data=pickup_excel_buffer,
+    file_name=f"ordenes_pickup_{date.today().strftime('%Y%m%d')}.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
+
+st.divider()
+
+# =========================================================
 # CIERRE DE DÍA (printable) — todo lo que ya despachamos
 # =========================================================
 st.header("📋 Cierre de día")
 
-columnas_cierre = ["paquete_id", "cedi", "metodo_envio", "marketplace_nombre", "transportadora", "hora_despacho"]
+columnas_cierre = [
+    "paquete_id", "cedi", "seller", "transportadora", "hora_despacho",
+]
 
 st.download_button(
     "⬇️ Descargar Excel — Cierre de día",
-    data=construir_excel(despachados, columnas_cierre),
+    data=construir_excel(despachados, columnas_cierre, incluir_metodo=False),
     file_name=f"cierre_de_dia_{date.today().strftime('%Y%m%d')}.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
@@ -364,8 +588,6 @@ st.download_button(
 cuerpo_cierre = f"""
 <p><i>Reporte del {date.today().strftime('%d/%m/%Y')}</i></p>
 <p><b>Total despachado hoy:</b> {total_despachadas} de {total_programadas} programadas ({pct_despachadas:.1f}%)</p>
-<h3>Por método de envío</h3>
-{tabla_conteo_html(despachados["metodo_envio"], "Método de envío")}
 <h3>Por transportadora</h3>
 {tabla_conteo_html(despachados["transportadora"], "Transportadora")}
 """
@@ -378,7 +600,9 @@ st.divider()
 # =========================================================
 st.header("🚫 Vencidas")
 
-columnas_vencidas = ["paquete_id", "cedi", "metodo_envio", "transportadora", "ubicacion", "hora_limite"]
+columnas_vencidas = [
+    "paquete_id", "cedi", "seller", "metodo_envio", "transportadora", "ubicacion", "ubicacion_fisica", "hora_limite",
+]
 
 st.download_button(
     "⬇️ Descargar Excel — Vencidas",
