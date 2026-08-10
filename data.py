@@ -203,14 +203,17 @@ ESTADOS_YA_DESPACHADOS = (
 ESTADOS_CONCLUIDOS = (6, 8)  # Picked-up by buyer, Delivered to buyer
 
 # NOTA DE RENDIMIENTO: sell_order_attempt.ship_timestamp no tiene índice
-# propio, así que la rama "ya despachadas" no puede acotarse tan agresivo
-# por fecha de creación como la rama "sin despachar" (que sí aprovecha el
-# índice compuesto por estado+fecha). Se usa una ventana más angosta (14
-# días) solo para esa rama — se probó contra la ventana completa de 45
-# días y la diferencia es de ~0.8% de filas (casi todo lo que se despacha
-# hoy se creó en los últimos 14 días), a cambio de pasar de ~10s a ~0.6s.
+# propio. En algún momento se acotó la rama "ya despachadas" a 14 días de
+# creation_date (en vez de 45, como la rama "sin despachar") para que
+# corriera más rápido — pero eso significa que una orden creada hace más de
+# 14 días y despachada HOY queda fuera del conteo. Se confirmó como bug
+# real: 4 paquetes de "Grupo ampm" creados el 20-23 de julio pero
+# despachados hoy no aparecían en Cierre de día. Como este reporte necesita
+# ser exacto (es un cierre operativo del día), se usa la misma ventana de
+# 45 días en ambas ramas — unos segundos más de espera vale la pena frente
+# a un conteo incorrecto.
 DIAS_ATRAS_SIN_DESPACHAR = 45
-DIAS_ATRAS_YA_DESPACHADO = 14
+DIAS_ATRAS_YA_DESPACHADO = 45
 
 
 def _conexion(intentos=3, espera_segundos=2):
@@ -241,16 +244,25 @@ def _conexion(intentos=3, espera_segundos=2):
 # no tienen índice propio, y sell_order_attempt tiene ~9.5M filas — filtrar
 # por esas columnas directamente fuerza un table scan completo. sell_order
 # sí tiene índices compuestos por (sell_order_state_id, creation_date), así
-# que la consulta se divide en DOS ramas (unidas por OR), cada una con su
-# propia lista de estados + ventana de creation_date, para que MySQL pueda
-# usar ese índice en ambas por separado en vez de un NOT IN amplio (que
-# resultó en table scan — probado con EXPLAIN):
-#   - Rama "sin despachar" (ESTADOS_SIN_DESPACHAR): ventana de 45 días,
-#     para cubrir B2B agendado con bastante anticipación.
-#   - Rama "ya despachadas" (ESTADOS_YA_DESPACHADOS): ventana de solo 14
-#     días — no se puede acotar más por el estado (son pocos valores, ~7,
-#     con mucho volumen histórico), así que se acota más por fecha. Se
-#     verificó que la diferencia contra 45 días es de ~0.8% de filas.
+# que la consulta se divide en DOS consultas separadas (antes eran dos ramas
+# unidas por OR en una sola consulta; se separaron del todo porque el
+# optimizador de MySQL necesitaba UN plan que sirviera bien a ambas ramas a
+# la vez, y en un cluster compartido con estadísticas que cambian eso
+# resultaba muy inestable — de segundos a varios minutos para la misma
+# consulta lógica). Cada consulta tiene su propia lista de estados + ventana
+# de creation_date:
+#   - "Sin despachar" (ESTADOS_SIN_DESPACHAR): ventana de 45 días, para
+#     cubrir B2B agendado con bastante anticipación.
+#   - "Ya despachadas" (ESTADOS_YA_DESPACHADOS): también 45 días — hubo un
+#     bug real con una ventana más angosta (ver nota junto a
+#     DIAS_ATRAS_YA_DESPACHADO), así que se prioriza exactitud del cierre de
+#     día sobre velocidad. Esta rama es la más pesada: el único índice
+#     disponible es por estado+creation_date (no hay índice en
+#     ship_timestamp), así que revisa cientos de miles de filas de
+#     sell_order cada vez. El tiempo de carga puede variar bastante según
+#     qué tan ocupado esté el cluster compartido — un arreglo definitivo
+#     necesitaría un índice nuevo en sell_order_attempt.ship_timestamp
+#     (cambio de esquema en producción, requiere autorización aparte).
 #
 # STRAIGHT_JOIN: sin esto, al agregar los joins de ubicación física
 # (sell_order_warehouse_location/warehouse_bin) el optimizador de MySQL
@@ -260,7 +272,18 @@ def _conexion(intentos=3, espera_segundos=2):
 # orden de las tablas tal como están escritas abajo (so -> soa -> sop -> ...),
 # que es el orden correcto. Verificado con EXPLAIN: sin esto la fila de soa
 # sale con type=ALL; con esto sale type=ref usando el índice.
-_QUERY = f"""
+#
+# NOTA DE RENDIMIENTO (separación en dos consultas): esta consulta original
+# combinaba ambas ramas ("sin despachar" y "ya despachados") en un solo
+# WHERE con OR. En un cluster compartido con estadísticas que cambian, eso
+# resultó muy inestable — el optimizador de MySQL necesita UN plan que sirva
+# bien a las dos ramas a la vez, y a veces elige mal para ambas (se observó
+# de ~3s a más de 3 minutos para la misma consulta lógica en distintos
+# momentos). Igual que se hizo con get_ordenes_pickup(), se separó en dos
+# consultas independientes — cada una con un filtro de estado y fecha simple
+# y sin ambigüedad — para que el optimizador elija un buen plan para cada una
+# por separado. Se ejecutan como dos round-trips y se concatenan en Python.
+_QUERY_BASE = """
     SELECT STRAIGHT_JOIN
         sop.id                          AS paquete_id_num,
         so.id                            AS orden_id,
@@ -272,6 +295,7 @@ _QUERY = f"""
         ep.name                         AS ecommerce_platform,
         sel.name                        AS seller,
         cc.name                         AS transportadora,
+        ts.name                         AS servicio_transporte,
         so.sell_order_state_id          AS estado_id,
         soa.ship_promise_max            AS hora_limite,
         soa.ship_timestamp              AS hora_despacho,
@@ -308,25 +332,58 @@ _QUERY = f"""
         ON ts.id = ds.transport_service_id
     LEFT JOIN courier_company cc
         ON cc.id = ts.courier_company_id
-    WHERE (
-        (so.sell_order_state_id IN %(estados_sin_despachar)s
-         AND so.creation_date >= CURDATE() - INTERVAL {DIAS_ATRAS_SIN_DESPACHAR} DAY
-         AND soa.ship_promise_max >= CURDATE() - INTERVAL 1 DAY
-         AND soa.ship_promise_max < CURDATE() + INTERVAL 2 DAY)
-        OR
-        (so.sell_order_state_id IN %(estados_ya_despachados)s
-         AND so.creation_date >= CURDATE() - INTERVAL {DIAS_ATRAS_YA_DESPACHADO} DAY
-         AND soa.ship_timestamp >= CURDATE() - INTERVAL 1 DAY
-         AND soa.ship_timestamp < CURDATE() + INTERVAL 2 DAY)
-    )
+    WHERE so.sell_order_state_id IN %(estados)s
+      AND so.creation_date >= CURDATE() - INTERVAL {dias_atras} DAY
+      AND {columna_fecha} >= CURDATE() - INTERVAL 1 DAY
+      AND {columna_fecha} < CURDATE() + INTERVAL 2 DAY
 """
 # El filtro de fechas de arriba es solo un pre-filtro amplio en UTC (para
 # aprovechar la ausencia de índice lo menos posible; el estado ya narrows
-# muchísimo antes de llegar aquí). Trae por ship_promise_max (para las que
-# siguen pendientes) O por ship_timestamp (para las que ya se despacharon),
-# porque "hoy" se define distinto según el caso (ver docstring). El filtro
-# exacto ya con cada fecha convertida a hora local se aplica después (ver
+# muchísimo antes de llegar aquí). La rama "sin despachar" filtra por
+# ship_promise_max y la rama "ya despachados" por ship_timestamp, porque
+# "hoy" se define distinto según el caso (ver docstring). El filtro exacto
+# ya con cada fecha convertida a hora local se aplica después (ver
 # _es_hoy_local).
+_QUERY_SIN_DESPACHAR = _QUERY_BASE.format(
+    dias_atras=DIAS_ATRAS_SIN_DESPACHAR, columna_fecha="soa.ship_promise_max"
+)
+_QUERY_YA_DESPACHADOS = _QUERY_BASE.format(
+    dias_atras=DIAS_ATRAS_YA_DESPACHADO, columna_fecha="soa.ship_timestamp"
+)
+
+
+def _transportadora_final(courier_nombre, servicio_nombre):
+    """courier_company.name solo dice "Mercado Libre" o "T1ENVIOS" para
+    todo — la distinción real (Agencia/Colecta/Flex/Full, DHL/FedEx/Última
+    Milla) que Julián ve en su sistema está un nivel más abajo, en
+    transport_service.name (ej. 'MELI-AGENCIA', 'T1ENVIOS-DHL-EXPRESS-
+    DOMESTIC'). Solo se desglosan los casos confirmados; el resto de
+    transportadoras se queda con el nombre de courier_company tal cual."""
+    if pd.isna(servicio_nombre):
+        return courier_nombre
+    servicio = servicio_nombre.upper()
+
+    if courier_nombre == "Mercado Libre":
+        if servicio.startswith("MELI-AGENCIA"):
+            return "Mercado Libre Agencia"
+        if servicio.startswith("MELI-COLECTA"):
+            return "Mercado Libre Colecta"
+        if servicio.startswith("MELI-FLEX"):
+            return "Mercado Libre Flex"
+        if servicio.startswith("MELI FULL"):
+            return "Mercado Libre Full"
+        return courier_nombre
+
+    if courier_nombre == "T1ENVIOS":
+        if "DHL" in servicio:
+            return "T1 Envíos DHL"
+        if "FEDEX" in servicio:
+            return "T1 Envíos FedEx"
+        if "ULTIMA-MILLA" in servicio or "ULTIMA MILLA" in servicio:
+            return "T1 Envíos Última Milla"
+        return "T1 Envíos"
+
+    return courier_nombre
 
 
 def _ubicacion(estado_id, hora_despacho):
@@ -375,12 +432,24 @@ def get_shipping_data() -> pd.DataFrame:
 
     conn = _conexion()
     try:
-        df = pd.read_sql(_QUERY, conn, params={
-            "estados_sin_despachar": ESTADOS_SIN_DESPACHAR,
-            "estados_ya_despachados": ESTADOS_YA_DESPACHADOS,
-        })
+        df_sin_despachar = pd.read_sql(
+            _QUERY_SIN_DESPACHAR, conn, params={"estados": ESTADOS_SIN_DESPACHAR}
+        )
+        df_ya_despachados = pd.read_sql(
+            _QUERY_YA_DESPACHADOS, conn, params={"estados": ESTADOS_YA_DESPACHADOS}
+        )
     finally:
         conn.close()
+    df = pd.concat([df_sin_despachar, df_ya_despachados], ignore_index=True)
+
+    # En la rama "sin despachar" hora_despacho siempre es NULL (todavía no se
+    # despacha nada), así que pandas la lee como dtype object en vez de
+    # datetime; al concatenar con la otra rama (que sí trae fechas reales)
+    # toda la columna queda en object y rompe el accessor .dt más abajo. Se
+    # fuerza el cast explícito por columna (mismo patrón que en
+    # get_ordenes_pickup()).
+    for col in ("hora_creacion", "hora_limite", "hora_despacho"):
+        df[col] = pd.to_datetime(df[col])
 
     # Sin bodega asignada no hay zona horaria con la cual ubicar "hoy" localmente.
     df = df.dropna(subset=["zona_horaria"]).copy()
@@ -390,6 +459,9 @@ def get_shipping_data() -> pd.DataFrame:
     df["paquete_id"] = df["orden_numero"].fillna("SO").astype(str) + "-" + df["paquete_id_num"].astype(str)
     df["marketplace_nombre"] = df["ecommerce_platform"].map(
         lambda p: MARKETPLACES.get(str(p).lower()) if pd.notna(p) else None
+    )
+    df["transportadora"] = df.apply(
+        lambda r: _transportadora_final(r["transportadora"], r["servicio_transporte"]), axis=1
     )
     df["ubicacion"] = df.apply(
         lambda r: _ubicacion(r["estado_id"], r["hora_despacho"]), axis=1
@@ -502,8 +574,13 @@ DIAS_LIMITE_PICKUP_SIN_RECOGER = 15
 # etc.) — se excluyen porque ya no hay nada que esperar.
 ESTADOS_PICKUP_RESUELTOS = (6, 7, 8, 15, 17, 18, 19, 20)
 
+# NOTA DE RENDIMIENTO: a diferencia de get_shipping_data(), aquí NO se usa
+# STRAIGHT_JOIN — se probó y esta consulta específica corre peor forzando
+# el orden (24s) que dejando que el optimizador de MySQL elija solo (2.7s).
+# Cada consulta puede necesitar un plan distinto; no asumir que lo que
+# ayuda en una ayuda en todas.
 _QUERY_PICKUP = """
-    SELECT STRAIGHT_JOIN
+    SELECT
         sop.id                          AS paquete_id_num,
         so.id                            AS orden_id,
         so.internal_order_number        AS orden_numero,
@@ -574,3 +651,83 @@ def get_ordenes_pickup() -> pd.DataFrame:
         "dias_vencido_pickup", "debe_cancelarse",
     ]
     return df[columnas]
+
+
+# --- Por ubicación (SORTER / Pendiente / Estiba) -------------------------
+#
+# Igual que "Entradas por hora", esta sección necesita su propia consulta:
+# get_shipping_data() solo trae órdenes cuya fecha límite es HOY, pero "Por
+# ubicación" pregunta algo distinto — "qué hay AHORITA físicamente en la
+# bodega", sin importar cuándo vence. Una orden "Packed" en SORTER-2 con
+# fecha límite de MAÑANA sigue estando físicamente en el sorter hoy, y por
+# eso desaparecía de este apartado — bug real encontrado con la orden
+# M1786044550154390.
+_QUERY_UBICACIONES = f"""
+    SELECT STRAIGHT_JOIN
+        sop.id                          AS paquete_id_num,
+        so.id                            AS orden_id,
+        so.internal_order_number        AS orden_numero,
+        w.country                       AS pais,
+        w.name                          AS cedi,
+        w.timezone_code                 AS zona_horaria,
+        sm.name                         AS metodo_envio,
+        sel.name                        AS seller,
+        cc.name                         AS transportadora,
+        ts.name                         AS servicio_transporte,
+        wb.name                          AS ubicacion_fisica,
+        so.sell_order_state_id          AS estado_id
+    FROM sell_order so
+    JOIN sell_order_attempt soa
+        ON soa.sell_order_id = so.id
+        AND soa.current = 1
+    JOIN sell_order_package sop
+        ON sop.sell_order_id = so.id
+    JOIN (
+        SELECT sell_order_id, MAX(id) AS ubicacion_id
+        FROM sell_order_warehouse_location
+        GROUP BY sell_order_id
+    ) sowl_ultima ON sowl_ultima.sell_order_id = so.id
+    JOIN sell_order_warehouse_location sowl
+        ON sowl.id = sowl_ultima.ubicacion_id
+    JOIN warehouse_bin wb
+        ON wb.id = sowl.warehouse_bin_id
+    LEFT JOIN warehouse w
+        ON w.id = so.assigned_warehouse_id
+    LEFT JOIN shipping_method sm
+        ON sm.id = so.shipping_method_id
+    LEFT JOIN seller sel
+        ON sel.id = so.seller_id
+    LEFT JOIN delivery_service ds
+        ON ds.sell_order_attempt_id = soa.id
+    LEFT JOIN transport_service ts
+        ON ts.id = ds.transport_service_id
+    LEFT JOIN courier_company cc
+        ON cc.id = ts.courier_company_id
+    WHERE so.sell_order_state_id IN %(estados_sin_despachar)s
+      AND soa.ship_timestamp IS NULL
+      AND so.creation_date >= CURDATE() - INTERVAL {DIAS_ATRAS_SIN_DESPACHAR} DAY
+"""
+
+
+def get_ubicaciones_fisicas() -> pd.DataFrame:
+    """Regresa TODOS los paquetes que ahorita mismo están físicamente en
+    algún bin de la bodega (SORTER/PEN/ESTIBA/etc.) y todavía no se
+    despachan — sin importar su fecha límite de despacho. Fuente de datos
+    de la sección "Por ubicación"."""
+
+    conn = _conexion()
+    try:
+        df = pd.read_sql(_QUERY_UBICACIONES, conn, params={
+            "estados_sin_despachar": ESTADOS_SIN_DESPACHAR,
+        })
+    finally:
+        conn.close()
+
+    df["paquete_id"] = df["orden_numero"].fillna("SO").astype(str) + "-" + df["paquete_id_num"].astype(str)
+    df["transportadora"] = df.apply(
+        lambda r: _transportadora_final(r["transportadora"], r["servicio_transporte"]), axis=1
+    )
+    return df[[
+        "paquete_id", "orden_id", "pais", "cedi", "metodo_envio", "seller",
+        "transportadora", "ubicacion_fisica",
+    ]]

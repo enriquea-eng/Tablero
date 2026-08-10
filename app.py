@@ -5,7 +5,7 @@ import pandas as pd
 import io
 import html as html_lib
 from datetime import datetime, date, timedelta, timezone
-from data import get_shipping_data, get_entradas_por_hora, get_ordenes_pickup
+from data import get_shipping_data, get_entradas_por_hora, get_ordenes_pickup, get_ubicaciones_fisicas
 
 st.set_page_config(page_title="Tablero de Envíos", layout="wide")
 
@@ -67,6 +67,29 @@ def tabla_conteo_html(serie, nombre_columna):
     """
 
 
+def tabla_ordenes_paquetes_html(df, columna, nombre_columna):
+    """Como tabla_conteo_html, pero separa cantidad de ÓRDENES (orden_id
+    único) de cantidad de PAQUETES (una fila = un paquete físico) — una
+    orden con varios paquetes cuenta 1 vez en "Órdenes" y varias en
+    "Paquetes"."""
+    resumen = df.groupby(columna).agg(
+        ordenes=("orden_id", "nunique"), paquetes=("paquete_id", "count")
+    )
+    filas_html = "".join(
+        f"<tr><td>{html_lib.escape(str(idx))}</td><td>{fila.ordenes}</td><td>{fila.paquetes}</td></tr>"
+        for idx, fila in resumen.iterrows()
+    )
+    return f"""
+    <table>
+        <thead><tr><th>{nombre_columna}</th><th>Órdenes</th><th>Paquetes</th></tr></thead>
+        <tbody>
+            {filas_html}
+            <tr><td><b>Total</b></td><td><b>{df["orden_id"].nunique()}</b></td><td><b>{len(df)}</b></td></tr>
+        </tbody>
+    </table>
+    """
+
+
 def _formatear_horas_locales(df, columnas=("hora_creacion", "hora_limite", "hora_despacho")):
     """Convierte columnas de datetime con zona horaria mixta (una por fila,
     según el país de la orden) a texto legible en SU hora local.
@@ -109,9 +132,13 @@ def construir_excel(detalle_df, columnas_detalle, incluir_metodo=True):
             detalle_df["metodo_envio"].value_counts().rename("cantidad").to_frame().to_excel(
                 writer, sheet_name="Por metodo de envio"
             )
-        detalle_df["transportadora"].fillna("Sin transportadora").value_counts().rename(
-            "cantidad"
-        ).to_frame().to_excel(writer, sheet_name="Por transportadora")
+        # Una orden con varios paquetes cuenta 1 vez en "ordenes" y varias en
+        # "paquetes" — por eso van separadas, no un solo "cantidad" ambiguo.
+        detalle_df.assign(transportadora=detalle_df["transportadora"].fillna("Sin transportadora")).groupby(
+            "transportadora"
+        ).agg(ordenes=("orden_id", "nunique"), paquetes=("paquete_id", "count")).to_excel(
+            writer, sheet_name="Por transportadora"
+        )
     buffer.seek(0)
     return buffer
 
@@ -152,11 +179,13 @@ if "data" not in st.session_state:
         st.session_state.data = get_shipping_data()
         st.session_state.entradas = get_entradas_por_hora()
         st.session_state.pickup = get_ordenes_pickup()
+        st.session_state.ubicaciones = get_ubicaciones_fisicas()
     st.session_state.ultima_actualizacion = datetime.now()
 
 df = st.session_state.data
 entradas = st.session_state.entradas
 pickup = st.session_state.pickup
+ubicaciones = st.session_state.ubicaciones
 
 # =========================================================
 # ENCABEZADO
@@ -183,6 +212,7 @@ with col_boton:
             st.session_state.data = get_shipping_data()
             st.session_state.entradas = get_entradas_por_hora()
             st.session_state.pickup = get_ordenes_pickup()
+            st.session_state.ubicaciones = get_ubicaciones_fisicas()
         st.session_state.ultima_actualizacion = datetime.now()
 
 st.divider()
@@ -215,18 +245,22 @@ with f4:
 df_filtrado = df.copy()
 entradas_filtrado = entradas.copy()
 pickup_filtrado = pickup.copy()
+ubicaciones_filtrado = ubicaciones.copy()
 if pais_sel != "Todos":
     df_filtrado = df_filtrado[df_filtrado["pais"] == pais_sel]
     entradas_filtrado = entradas_filtrado[entradas_filtrado["pais"] == pais_sel]
     pickup_filtrado = pickup_filtrado[pickup_filtrado["pais"] == pais_sel]
+    ubicaciones_filtrado = ubicaciones_filtrado[ubicaciones_filtrado["pais"] == pais_sel]
 if cedi_sel != "Todos":
     df_filtrado = df_filtrado[df_filtrado["cedi"] == cedi_sel]
     entradas_filtrado = entradas_filtrado[entradas_filtrado["cedi"] == cedi_sel]
     pickup_filtrado = pickup_filtrado[pickup_filtrado["cedi"] == cedi_sel]
+    ubicaciones_filtrado = ubicaciones_filtrado[ubicaciones_filtrado["cedi"] == cedi_sel]
 if seller_sel != "Todos":
     df_filtrado = df_filtrado[df_filtrado["seller"] == seller_sel]
     entradas_filtrado = entradas_filtrado[entradas_filtrado["seller"] == seller_sel]
     pickup_filtrado = pickup_filtrado[pickup_filtrado["seller"] == seller_sel]
+    ubicaciones_filtrado = ubicaciones_filtrado[ubicaciones_filtrado["seller"] == seller_sel]
 
 st.divider()
 
@@ -442,33 +476,50 @@ st.divider()
 st.header("Por ubicación")
 st.caption(
     "Basado en la ubicación física real del paquete (bin/posición en la bodega), "
-    "no en el estado de la orden."
+    "no en el estado de la orden ni en su fecha límite."
 )
 
-u1, u2, u3 = st.columns(3)
+columnas_ubicacion = ["paquete_id", "cedi", "seller", "metodo_envio", "ubicacion_fisica", "transportadora"]
 
-sorting = pendientes[pendientes["ubicacion_fisica"].str.contains("SORTER", case=False, na=False)]
-en_pendiente = pendientes[
-    pendientes["ubicacion_fisica"].str.contains("PEN", case=False, na=False)
-    & pendientes["transportadora"].isna()
-]
-en_estiba = pendientes[
-    pendientes["ubicacion_fisica"].str.contains("ESTIBA", case=False, na=False)
-    & pendientes["transportadora"].isna()
-]
 
-u1.metric("SORTER", len(sorting))
-u2.metric("Pendiente (sin transportadora)", len(en_pendiente))
-u3.metric("Estiba (sin transportadora)", len(en_estiba))
+def _metricas_ubicacion(base_df, etiqueta):
+    sorting = base_df[base_df["ubicacion_fisica"].str.contains("SORTER", case=False, na=False)]
+    en_pendiente = base_df[
+        base_df["ubicacion_fisica"].str.contains("PEN", case=False, na=False)
+        & base_df["transportadora"].isna()
+    ]
+    en_estiba = base_df[
+        base_df["ubicacion_fisica"].str.contains("ESTIBA", case=False, na=False)
+        & base_df["transportadora"].isna()
+    ]
+    u1, u2, u3 = st.columns(3)
+    u1.metric(f"SORTER ({etiqueta})", len(sorting))
+    u2.metric(f"Pendiente sin transportadora ({etiqueta})", len(en_pendiente))
+    u3.metric(f"Estiba sin transportadora ({etiqueta})", len(en_estiba))
+    with st.expander(f"Ver detalle — {etiqueta}"):
+        st.write("**SORTER**")
+        st.dataframe(sorting[columnas_ubicacion], use_container_width=True)
+        st.write("**Pendiente (sin transportadora)**")
+        st.dataframe(en_pendiente[columnas_ubicacion], use_container_width=True)
+        st.write("**Estiba (sin transportadora)**")
+        st.dataframe(en_estiba[columnas_ubicacion], use_container_width=True)
 
-with st.expander("Ver detalle"):
-    columnas_ubicacion = ["paquete_id", "cedi", "seller", "metodo_envio", "ubicacion_fisica", "transportadora"]
-    st.write("**SORTER**")
-    st.dataframe(sorting[columnas_ubicacion], use_container_width=True)
-    st.write("**Pendiente (sin transportadora)**")
-    st.dataframe(en_pendiente[columnas_ubicacion], use_container_width=True)
-    st.write("**Estiba (sin transportadora)**")
-    st.dataframe(en_estiba[columnas_ubicacion], use_container_width=True)
+
+# ubicaciones_filtrado trae TODO lo que está físicamente en la bodega ahora
+# mismo, sin importar su fecha límite. Se separa en dos grupos: lo que
+# coincide con un paquete "de hoy" (mismo criterio que el resto del
+# tablero) y todo lo demás (vencido de días anteriores, o programado para
+# días futuros — como el ejemplo de la orden con fecha límite de mañana
+# que seguía sentada en SORTER-2 hoy).
+paquetes_hoy_ids = set(df_filtrado["paquete_id"])
+ubicaciones_hoy = ubicaciones_filtrado[ubicaciones_filtrado["paquete_id"].isin(paquetes_hoy_ids)]
+ubicaciones_otros_dias = ubicaciones_filtrado[~ubicaciones_filtrado["paquete_id"].isin(paquetes_hoy_ids)]
+
+st.subheader("Hoy")
+_metricas_ubicacion(ubicaciones_hoy, "hoy")
+
+st.subheader("Otros días (mañana o vencidas)")
+_metricas_ubicacion(ubicaciones_otros_dias, "otros días")
 
 st.divider()
 
@@ -587,9 +638,10 @@ st.download_button(
 
 cuerpo_cierre = f"""
 <p><i>Reporte del {date.today().strftime('%d/%m/%Y')}</i></p>
-<p><b>Total despachado hoy:</b> {total_despachadas} de {total_programadas} programadas ({pct_despachadas:.1f}%)</p>
+<p><b>Total despachado hoy:</b> {total_despachadas} paquetes
+   ({despachados["orden_id"].nunique()} órdenes) de {total_programadas} programadas ({pct_despachadas:.1f}%)</p>
 <h3>Por transportadora</h3>
-{tabla_conteo_html(despachados["transportadora"], "Transportadora")}
+{tabla_ordenes_paquetes_html(despachados, "transportadora", "Transportadora")}
 """
 render_reporte_imprimible(cuerpo_cierre, altura=420)
 
