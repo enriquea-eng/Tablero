@@ -5,7 +5,10 @@ import pandas as pd
 import io
 import html as html_lib
 from datetime import datetime, date, timedelta, timezone
-from data import get_shipping_data, get_entradas_por_hora, get_ordenes_pickup, get_ubicaciones_fisicas
+from data import (
+    get_shipping_data, get_entradas_por_hora, get_ordenes_pickup, get_ubicaciones_fisicas,
+    ID_TIPO_RUTA_MENSAJEROS,
+)
 
 st.set_page_config(page_title="Tablero de Envíos", layout="wide")
 
@@ -182,11 +185,6 @@ if "data" not in st.session_state:
         st.session_state.ubicaciones = get_ubicaciones_fisicas()
     st.session_state.ultima_actualizacion = datetime.now()
 
-df = st.session_state.data
-entradas = st.session_state.entradas
-pickup = st.session_state.pickup
-ubicaciones = st.session_state.ubicaciones
-
 # =========================================================
 # ENCABEZADO
 # =========================================================
@@ -195,13 +193,25 @@ col_titulo, col_fecha, col_boton = st.columns([3, 1.3, 1])
 with col_titulo:
     st.title("📦 Tablero de Envíos por Despachar")
 
+def _texto_ultima_actualizacion():
+    return f"🕒 {st.session_state.ultima_actualizacion.strftime('%d/%m/%Y · %H:%M:%S')}"
+
+
 with col_fecha:
     st.write("")  # separación vertical
-    st.write(f"🕒 {st.session_state.ultima_actualizacion.strftime('%d/%m/%Y · %H:%M:%S')}")
+    # st.empty() en vez de st.write() directo: así, si un botón más abajo en
+    # el script (Actualizar todo o Actualizar solo <país>) cambia
+    # ultima_actualizacion, se puede refrescar ESTE mismo texto llamando
+    # marca_tiempo.write(...) de nuevo — con st.write() normal, el texto ya
+    # quedaría renderizado con la hora vieja para toda esta vuelta del
+    # script (mismo problema que los DataFrames leídos antes de tiempo, ver
+    # nota más abajo).
+    marca_tiempo = st.empty()
+    marca_tiempo.write(_texto_ultima_actualizacion())
 
 with col_boton:
     st.write("")  # separación vertical
-    if st.button("🔄 Actualizar", use_container_width=True):
+    if st.button("🔄 Actualizar todo", use_container_width=True):
         # Sin más código después de esto (nada de st.rerun()): un clic de
         # botón ya provoca su propia vuelta completa del script. Si se corta
         # la ejecución aquí con st.rerun(), el script nunca llega a crear los
@@ -214,6 +224,19 @@ with col_boton:
             st.session_state.pickup = get_ordenes_pickup()
             st.session_state.ubicaciones = get_ubicaciones_fisicas()
         st.session_state.ultima_actualizacion = datetime.now()
+        marca_tiempo.write(_texto_ultima_actualizacion())
+
+# df/entradas/pickup/ubicaciones se leen de session_state AQUÍ, después de
+# los botones de arriba — si se leyeran antes (como estaba originalmente),
+# un clic en "Actualizar" dejaría estas variables apuntando a los datos
+# VIEJOS durante esa misma vuelta del script (la reasignación de
+# session_state adentro del botón no actualiza retroactivamente una
+# variable ya leída antes en el mismo run), y el usuario vería datos
+# desactualizados hasta la siguiente interacción.
+df = st.session_state.data
+entradas = st.session_state.entradas
+pickup = st.session_state.pickup
+ubicaciones = st.session_state.ubicaciones
 
 st.divider()
 
@@ -223,23 +246,80 @@ st.divider()
 f1, f2, f3, f4 = st.columns(4)
 
 paises = ["Todos"] + sorted(df["pais"].dropna().unique().tolist())
-cedis = ["Todos"] + sorted(df["cedi"].dropna().unique().tolist())
 sellers = ["Todos"] + sorted(df["seller"].dropna().unique().tolist())
 
 
 def limpiar_filtros():
     st.session_state.filtro_pais = "Todos"
-    st.session_state.filtro_cedi = "Todos"
+    st.session_state.filtro_cedi = []
     st.session_state.filtro_seller = "Todos"
 
 
-pais_sel = f1.selectbox("País", paises, key="filtro_pais")
-cedi_sel = f2.selectbox("Cedi", cedis, key="filtro_cedi")
+def _resetear_cedi_al_cambiar_pais():
+    # Si tenías cedis de otro país seleccionados y cambias de país, esos
+    # cedis ya no van a estar en la nueva lista de opciones — sin este
+    # reset, el multiselect de Cedi truena porque sus valores guardados ya
+    # no son opciones válidas.
+    st.session_state.filtro_cedi = []
+
+
+pais_sel = f1.selectbox(
+    "País", paises, key="filtro_pais", on_change=_resetear_cedi_al_cambiar_pais
+)
+
+# El Cedi se acota al país seleccionado (Julián: al elegir México, que solo
+# aparezcan las bodegas de México) — pero sigue permitiendo "Todos" o elegir
+# cualquiera dentro de ese país.
+if pais_sel != "Todos":
+    cedis = ["Todos"] + sorted(df[df["pais"] == pais_sel]["cedi"].dropna().unique().tolist())
+else:
+    cedis = ["Todos"] + sorted(df["cedi"].dropna().unique().tolist())
+
+# Multiselect (Julián: poder elegir varias bodegas a la vez, ej. 2 de las 5
+# de Colombia) — se deja "Todos" como opción explícita en la lista, pero no
+# como default: sin nada seleccionado, o con "Todos" incluido, se
+# interpreta como "sin filtro" (ver más abajo donde se aplica el filtro).
+cedi_sel = f2.multiselect("Cedi", cedis, default=[], key="filtro_cedi")
 seller_sel = f3.selectbox("Seller", sellers, key="filtro_seller")
 
 with f4:
     st.write("")
     st.button("✕ Limpiar filtros", use_container_width=True, on_click=limpiar_filtros)
+
+# --- Actualizar solo el país seleccionado (más rápido que "Actualizar
+# todo" porque el filtro de país va directo en el SQL, no solo en Python —
+# ver parámetro pais en data.py). Reemplaza únicamente las filas de ESE
+# país en cada DataFrame guardado en session_state; los demás países se
+# quedan tal como estaban (pueden quedar desactualizados hasta su propio
+# refresh o hasta el próximo "Actualizar todo"). ---
+if pais_sel != "Todos":
+    if st.button(f"⚡ Actualizar solo {pais_sel}", use_container_width=True):
+        with st.spinner(f"Actualizando solo {pais_sel}..."):
+            nuevo_data = get_shipping_data(pais=pais_sel)
+            nuevo_entradas = get_entradas_por_hora(pais=pais_sel)
+            nuevo_pickup = get_ordenes_pickup(pais=pais_sel)
+            nuevo_ubicaciones = get_ubicaciones_fisicas(pais=pais_sel)
+        st.session_state.data = pd.concat(
+            [df[df["pais"] != pais_sel], nuevo_data], ignore_index=True
+        )
+        st.session_state.entradas = pd.concat(
+            [entradas[entradas["pais"] != pais_sel], nuevo_entradas], ignore_index=True
+        )
+        st.session_state.pickup = pd.concat(
+            [pickup[pickup["pais"] != pais_sel], nuevo_pickup], ignore_index=True
+        )
+        st.session_state.ubicaciones = pd.concat(
+            [ubicaciones[ubicaciones["pais"] != pais_sel], nuevo_ubicaciones], ignore_index=True
+        )
+        st.session_state.ultima_actualizacion = datetime.now()
+        marca_tiempo.write(_texto_ultima_actualizacion())
+        # Igual que arriba: refrescar las variables locales con lo que se
+        # acaba de guardar, para que el resto del script (filtros, tablas,
+        # gráficas) use los datos nuevos en esta misma vuelta.
+        df = st.session_state.data
+        entradas = st.session_state.entradas
+        pickup = st.session_state.pickup
+        ubicaciones = st.session_state.ubicaciones
 
 # --- Aplicar filtros ---
 df_filtrado = df.copy()
@@ -251,11 +331,11 @@ if pais_sel != "Todos":
     entradas_filtrado = entradas_filtrado[entradas_filtrado["pais"] == pais_sel]
     pickup_filtrado = pickup_filtrado[pickup_filtrado["pais"] == pais_sel]
     ubicaciones_filtrado = ubicaciones_filtrado[ubicaciones_filtrado["pais"] == pais_sel]
-if cedi_sel != "Todos":
-    df_filtrado = df_filtrado[df_filtrado["cedi"] == cedi_sel]
-    entradas_filtrado = entradas_filtrado[entradas_filtrado["cedi"] == cedi_sel]
-    pickup_filtrado = pickup_filtrado[pickup_filtrado["cedi"] == cedi_sel]
-    ubicaciones_filtrado = ubicaciones_filtrado[ubicaciones_filtrado["cedi"] == cedi_sel]
+if cedi_sel and "Todos" not in cedi_sel:
+    df_filtrado = df_filtrado[df_filtrado["cedi"].isin(cedi_sel)]
+    entradas_filtrado = entradas_filtrado[entradas_filtrado["cedi"].isin(cedi_sel)]
+    pickup_filtrado = pickup_filtrado[pickup_filtrado["cedi"].isin(cedi_sel)]
+    ubicaciones_filtrado = ubicaciones_filtrado[ubicaciones_filtrado["cedi"].isin(cedi_sel)]
 if seller_sel != "Todos":
     df_filtrado = df_filtrado[df_filtrado["seller"] == seller_sel]
     entradas_filtrado = entradas_filtrado[entradas_filtrado["seller"] == seller_sel]
@@ -629,6 +709,18 @@ columnas_cierre = [
     "paquete_id", "cedi", "seller", "transportadora", "hora_despacho",
 ]
 
+# "Rutas mensajeros" cuenta RUTAS (delivery_route.id distintos vía
+# ruta_numero), no órdenes ni paquetes — varias órdenes/paquetes salen en
+# la misma ruta. ruta_tipo_id=2 (delivery_route_type "Route") las distingue
+# de las recolecciones de transportadora (tipo 1, "Dispatch").
+rutas_mensajeros = despachados[despachados["ruta_tipo_id"] == ID_TIPO_RUTA_MENSAJEROS]
+total_rutas_mensajeros = rutas_mensajeros["ruta_numero"].nunique()
+total_paquetes_rutas_mensajeros = len(rutas_mensajeros)
+
+r1, r2 = st.columns(2)
+r1.metric("Rutas mensajeros", total_rutas_mensajeros)
+r2.metric("Paquetes en rutas mensajeros", total_paquetes_rutas_mensajeros)
+
 st.download_button(
     "⬇️ Descargar Excel — Cierre de día",
     data=construir_excel(despachados, columnas_cierre, incluir_metodo=False),
@@ -640,6 +732,7 @@ cuerpo_cierre = f"""
 <p><i>Reporte del {date.today().strftime('%d/%m/%Y')}</i></p>
 <p><b>Total despachado hoy:</b> {total_despachadas} paquetes
    ({despachados["orden_id"].nunique()} órdenes) de {total_programadas} programadas ({pct_despachadas:.1f}%)</p>
+<p><b>Rutas mensajeros:</b> {total_rutas_mensajeros} rutas, {total_paquetes_rutas_mensajeros} paquetes</p>
 <h3>Por transportadora</h3>
 {tabla_ordenes_paquetes_html(despachados, "transportadora", "Transportadora")}
 """

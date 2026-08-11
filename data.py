@@ -44,6 +44,14 @@ regresa un DataFrame con estas columnas, que es lo único que espera app.py:
     hora_creacion_hora_local -> hora del día (0-23) de hora_creacion ya en
                             hora local de la bodega, para el gráfico de
                             "Entradas por hora".
+    ruta_numero          -> delivery_route.internal_route_number (ej.
+                            'R0000548259') del intento vigente. None si el
+                            paquete no está asignado a ninguna ruta.
+    ruta_tipo_id          -> delivery_route.delivery_route_type_id: 1 =
+                            Dispatch (recolección de transportadora), 2 =
+                            Route (ruta propia de mensajeros). Usado en
+                            Cierre de día para contar RUTAS de mensajeros,
+                            no órdenes ni paquetes.
 
 hora_creacion, hora_limite y hora_despacho quedan en la hora LOCAL de la
 bodega de cada orden (no UTC), cada una como datetime con zona horaria
@@ -193,14 +201,11 @@ ESTADOS_YA_DESPACHADOS = (
     20,  # Delivery not posible
 )
 
-# Subconjunto de ESTADOS_YA_DESPACHADOS que ya "terminó su viaje" con
-# éxito (nadie tiene que seguir haciendo nada con ellas). get_shipping_data()
-# SÍ las cuenta como "Despachado" (por ship_timestamp, no por estado — ver
-# arriba), pero get_entradas_por_hora() las excluye a propósito: confirmado
-# con Julián que en el detalle de "Entradas por hora" (Mismo día/Siguiente
-# día) solo deben verse las que siguen en proceso, aunque ya se hayan
-# despachado hoy — ver una orden "Delivered to buyer" ahí generaba confusión.
-ESTADOS_CONCLUIDOS = (6, 8)  # Picked-up by buyer, Delivered to buyer
+# delivery_route_type: 1 = Dispatch (recolección de transportadora),
+# 2 = Route (ruta propia de mensajeros). Confirmado con Julián: "Rutas
+# mensajeros" en Cierre de día cuenta RUTAS (delivery_route.id distintos),
+# no órdenes ni paquetes — varias órdenes/paquetes van en la misma ruta.
+ID_TIPO_RUTA_MENSAJEROS = 2
 
 # NOTA DE RENDIMIENTO: sell_order_attempt.ship_timestamp no tiene índice
 # propio. En algún momento se acotó la rama "ya despachadas" a 14 días de
@@ -238,6 +243,33 @@ def _conexion(intentos=3, espera_segundos=2):
             if intento < intentos:
                 time.sleep(espera_segundos)
     raise ultimo_error
+
+
+def _warehouse_ids_por_pais(conn, pais):
+    """Resuelve el nombre de país a la lista de assigned_warehouse_id de
+    ese país (warehouse es una tabla chica, ~17 filas — esta consulta es
+    prácticamente instantánea). Si pais es None regresa (-1,), un id que
+    nunca existe: en las consultas que usan esto, el filtro real es
+    `%(pais)s IS NULL OR assigned_warehouse_id IN %(warehouse_ids)s`, así
+    que cuando pais es None el OR ya es verdadero por el primer lado y el
+    contenido de warehouse_ids no importa — pero SQL igual exige que la
+    lista de IN() sea sintácticamente válida y no vacía.
+
+    Se hace así (lista literal de ids) y NO con un subquery correlacionado
+    (`assigned_warehouse_id IN (SELECT id FROM warehouse WHERE country=...)`)
+    porque se probó con EXPLAIN: el subquery correlacionado NO cambia el
+    plan de sell_order (sigue examinando ~750K filas igual que sin filtro,
+    MySQL lo evalúa como post-filtro) — pero pasar los ids ya resueltos como
+    lista permite que el optimizador use el índice compuesto que arranca por
+    assigned_warehouse_id (idx_so_assigned_wh_creation2), bajando a ~270K
+    filas examinadas para un solo país. Es la base del botón "Actualizar
+    solo <país>" del tablero."""
+    if pais is None:
+        return (-1,)
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM warehouse WHERE country = %s", (pais,))
+    ids = tuple(row[0] for row in cur.fetchall())
+    return ids if ids else (-1,)
 
 
 # NOTA DE RENDIMIENTO: sell_order_attempt.ship_promise_max/ship_timestamp
@@ -300,7 +332,9 @@ _QUERY_BASE = """
         soa.ship_promise_max            AS hora_limite,
         soa.ship_timestamp              AS hora_despacho,
         so.creation_date                AS hora_creacion,
-        wb.name                          AS ubicacion_fisica
+        wb.name                          AS ubicacion_fisica,
+        dr.internal_route_number        AS ruta_numero,
+        dr.delivery_route_type_id       AS ruta_tipo_id
     FROM sell_order so
     JOIN sell_order_attempt soa
         ON soa.sell_order_id = so.id
@@ -332,10 +366,13 @@ _QUERY_BASE = """
         ON ts.id = ds.transport_service_id
     LEFT JOIN courier_company cc
         ON cc.id = ts.courier_company_id
+    LEFT JOIN delivery_route dr
+        ON dr.id = soa.delivery_route_id
     WHERE so.sell_order_state_id IN %(estados)s
       AND so.creation_date >= CURDATE() - INTERVAL {dias_atras} DAY
       AND {columna_fecha} >= CURDATE() - INTERVAL 1 DAY
       AND {columna_fecha} < CURDATE() + INTERVAL 2 DAY
+      AND (%(pais)s IS NULL OR so.assigned_warehouse_id IN %(warehouse_ids)s)
 """
 # El filtro de fechas de arriba es solo un pre-filtro amplio en UTC (para
 # aprovechar la ausencia de índice lo menos posible; el estado ya narrows
@@ -350,6 +387,27 @@ _QUERY_SIN_DESPACHAR = _QUERY_BASE.format(
 _QUERY_YA_DESPACHADOS = _QUERY_BASE.format(
     dias_atras=DIAS_ATRAS_YA_DESPACHADO, columna_fecha="soa.ship_timestamp"
 )
+
+
+# "Colecta" no es una sola transportadora: MELI-COLECTA es el nombre
+# genérico, pero varias vienen con un sufijo que identifica a la empresa que
+# físicamente recoge el paquete (verificado en transport_service.name).
+# Cualquier sufijo nuevo que aparezca y no esté aquí cae al fallback
+# genérico de _humanizar_sufijo (título + guiones bajos a espacios), no se
+# pierde silenciosamente.
+_COLECTA_SUFIJOS_CONOCIDOS = {
+    "YADATEX": "Yadatex",
+    "MT_DE_MEXICO": "MT de México",
+    "WINE": "Wine",
+    "ENVIA": "Envía",
+}
+
+
+def _humanizar_sufijo(sufijo):
+    conocido = _COLECTA_SUFIJOS_CONOCIDOS.get(sufijo)
+    if conocido:
+        return conocido
+    return sufijo.replace("_", " ").title()
 
 
 def _transportadora_final(courier_nombre, servicio_nombre):
@@ -367,6 +425,9 @@ def _transportadora_final(courier_nombre, servicio_nombre):
         if servicio.startswith("MELI-AGENCIA"):
             return "Mercado Libre Agencia"
         if servicio.startswith("MELI-COLECTA"):
+            sufijo = servicio[len("MELI-COLECTA"):].lstrip("-")
+            if sufijo:
+                return f"Mercado Libre Colecta {_humanizar_sufijo(sufijo)}"
             return "Mercado Libre Colecta"
         if servicio.startswith("MELI-FLEX"):
             return "Mercado Libre Flex"
@@ -426,17 +487,26 @@ def _es_hoy_local(df):
     return es_hoy
 
 
-def get_shipping_data() -> pd.DataFrame:
+def get_shipping_data(pais=None) -> pd.DataFrame:
     """Regresa los paquetes cuya fecha máxima de despacho es hoy, evaluada
-    en la hora local de cada bodega."""
+    en la hora local de cada bodega.
+
+    pais: si se da (ej. "México"), acota la consulta SQL a las bodegas de
+    ese país (so.assigned_warehouse_id) en vez de traer los 3 países y
+    filtrar después en Python — pensado para el botón "Actualizar solo
+    <país>" del tablero, que así es más rápido que un refresh completo sin
+    perder el resto de los datos ya cargados de otros países."""
 
     conn = _conexion()
     try:
+        warehouse_ids = _warehouse_ids_por_pais(conn, pais)
         df_sin_despachar = pd.read_sql(
-            _QUERY_SIN_DESPACHAR, conn, params={"estados": ESTADOS_SIN_DESPACHAR}
+            _QUERY_SIN_DESPACHAR, conn,
+            params={"estados": ESTADOS_SIN_DESPACHAR, "pais": pais, "warehouse_ids": warehouse_ids},
         )
         df_ya_despachados = pd.read_sql(
-            _QUERY_YA_DESPACHADOS, conn, params={"estados": ESTADOS_YA_DESPACHADOS}
+            _QUERY_YA_DESPACHADOS, conn,
+            params={"estados": ESTADOS_YA_DESPACHADOS, "pais": pais, "warehouse_ids": warehouse_ids},
         )
     finally:
         conn.close()
@@ -476,6 +546,7 @@ def get_shipping_data() -> pd.DataFrame:
         "paquete_id", "orden_id", "pais", "cedi", "metodo_envio", "marketplace_nombre",
         "seller", "transportadora", "ubicacion", "ubicacion_fisica", "fecha_salida",
         "hora_creacion", "hora_limite", "hora_despacho", "hora_creacion_hora_local",
+        "ruta_numero", "ruta_tipo_id",
     ]
     return df[columnas]
 
@@ -484,15 +555,20 @@ def get_shipping_data() -> pd.DataFrame:
 # hoy, o ya despachada hoy). Una orden "Siguiente día" creada hoy casi
 # siempre tiene fecha límite de MAÑANA, así que nunca aparece ahí — pero sí
 # "entró" hoy. Por eso "Entradas por hora" necesita su propia consulta,
-# basada en creation_date en vez de ship_promise_max/ship_timestamp. Usa el
-# MISMO criterio de estados (ESTADOS_BLOQUEADOS) que el resto del tablero,
-# para que los números sean consistentes en todas partes.
+# basada en creation_date en vez de ship_promise_max/ship_timestamp.
 #
 # NOTA DE RENDIMIENTO: creation_date no tiene un índice propio (solo existe
 # combinada con otras columnas, ej. (sell_order_state_id, creation_date)),
 # así que filtrar solo por fecha fuerza un table scan de sell_order
-# completo (~9.8M filas). El filtro de estado, además de ser necesario,
-# permite aprovechar ese índice compuesto.
+# completo (~9.9M filas). Por eso el filtro de estado sigue en el WHERE —
+# usa ESTADOS_SIN_DESPACHAR + ESTADOS_YA_DESPACHADOS (el mismo criterio de
+# estados "reales" que get_shipping_data(), arrancando desde "All items
+# reserved - ready for fulfillment"), no la lista completa de 29 estados:
+# así se excluyen los que no son parte del flujo normal (canceladas, en
+# espera por stock, bloqueadas, error, etc. — confirmado con Julián que esos
+# no deben contar aquí), y de paso la consulta sigue pudiendo usar el
+# índice compuesto (sell_order_state_id, creation_date) en vez de escanear
+# la tabla completa.
 _QUERY_ENTRADAS = """
     SELECT
         so.internal_order_number AS orden_numero,
@@ -512,30 +588,40 @@ _QUERY_ENTRADAS = """
         ON sel.id = so.seller_id
     LEFT JOIN sell_order_state ss
         ON ss.id = so.sell_order_state_id
-    WHERE so.sell_order_state_id IN %(estados_activos)s
+    WHERE so.sell_order_state_id IN %(estados)s
       AND so.creation_date >= CURDATE() - INTERVAL 1 DAY
       AND so.creation_date < CURDATE() + INTERVAL 2 DAY
+      AND (%(pais)s IS NULL OR so.assigned_warehouse_id IN %(warehouse_ids)s)
 """
 
 
-def get_entradas_por_hora() -> pd.DataFrame:
-    """Regresa todas las órdenes CREADAS hoy (hora local de su bodega) que
-    siguen en proceso — ESTADOS_SIN_DESPACHAR + ESTADOS_YA_DESPACHADOS menos
-    ESTADOS_CONCLUIDOS (Picked-up/Delivered to buyer se excluyen a propósito
-    aquí, ver ESTADOS_CONCLUIDOS) —, sin importar su fecha límite de
-    despacho. Es la fuente de datos de la gráfica "Entradas por hora" —
+def get_entradas_por_hora(pais=None) -> pd.DataFrame:
+    """Regresa las órdenes CREADAS hoy (hora local de su bodega) cuyo estado
+    está dentro del flujo normal (ESTADOS_SIN_DESPACHAR + ESTADOS_YA_DESPACHADOS,
+    arrancando desde "All items reserved - ready for fulfillment"), sin
+    importar su fecha límite de despacho — es un conteo ACUMULADO: confirmado
+    con Julián que una orden que entró a cierta hora debe seguir contando ahí
+    el resto del día aunque después se despache (incluyendo Delivered/
+    Picked-up by buyer — con mensajeros puede que ya se haya entregado el
+    mismo día) — lo que SÍ se excluye son los estados que no son parte del
+    flujo real (canceladas, en espera por stock, bloqueadas, error, etc.).
+    Es la fuente de datos de la gráfica "Entradas por hora" —
     deliberadamente separada de get_shipping_data() por la fecha
     (creation_date vs ship_promise_max/ship_timestamp). Aquí sí se puede
     usar una sola lista de estados (a diferencia de get_shipping_data): la
     ventana de creation_date ya es angosta de por sí (~3 días), así que no
-    hace falta partirla en dos ramas por rendimiento."""
+    hace falta partirla en dos ramas por rendimiento.
 
-    estados_activos = tuple(
-        e for e in ESTADOS_SIN_DESPACHAR + ESTADOS_YA_DESPACHADOS if e not in ESTADOS_CONCLUIDOS
-    )
+    pais: ver get_shipping_data()."""
+
     conn = _conexion()
     try:
-        df = pd.read_sql(_QUERY_ENTRADAS, conn, params={"estados_activos": estados_activos})
+        warehouse_ids = _warehouse_ids_por_pais(conn, pais)
+        estados = ESTADOS_SIN_DESPACHAR + ESTADOS_YA_DESPACHADOS
+        df = pd.read_sql(
+            _QUERY_ENTRADAS, conn,
+            params={"estados": estados, "pais": pais, "warehouse_ids": warehouse_ids},
+        )
     finally:
         conn.close()
 
@@ -606,21 +692,27 @@ _QUERY_PICKUP = """
         ON sel.id = so.seller_id
     WHERE so.shipping_method_id IN %(metodos_pickup)s
       AND so.sell_order_state_id NOT IN %(estados_resueltos)s
+      AND (%(pais)s IS NULL OR so.assigned_warehouse_id IN %(warehouse_ids)s)
 """
 
 
-def get_ordenes_pickup() -> pd.DataFrame:
+def get_ordenes_pickup(pais=None) -> pd.DataFrame:
     """Regresa todas las órdenes de recogida (cualquier método "Recogida...")
     que todavía no se resuelven (no recogidas, no canceladas), sin importar
     cuándo se crearon — a propósito, porque el objetivo de esta sección es
     detectar las que llevan MUCHO tiempo esperando (más de
-    DIAS_LIMITE_PICKUP_SIN_RECOGER días desde su pickup_promise_max)."""
+    DIAS_LIMITE_PICKUP_SIN_RECOGER días desde su pickup_promise_max).
+
+    pais: ver get_shipping_data()."""
 
     conn = _conexion()
     try:
+        warehouse_ids = _warehouse_ids_por_pais(conn, pais)
         df = pd.read_sql(_QUERY_PICKUP, conn, params={
             "metodos_pickup": METODOS_PICKUP_IDS,
             "estados_resueltos": ESTADOS_PICKUP_RESUELTOS,
+            "pais": pais,
+            "warehouse_ids": warehouse_ids,
         })
     finally:
         conn.close()
@@ -706,19 +798,25 @@ _QUERY_UBICACIONES = f"""
     WHERE so.sell_order_state_id IN %(estados_sin_despachar)s
       AND soa.ship_timestamp IS NULL
       AND so.creation_date >= CURDATE() - INTERVAL {DIAS_ATRAS_SIN_DESPACHAR} DAY
+      AND (%(pais)s IS NULL OR so.assigned_warehouse_id IN %(warehouse_ids)s)
 """
 
 
-def get_ubicaciones_fisicas() -> pd.DataFrame:
+def get_ubicaciones_fisicas(pais=None) -> pd.DataFrame:
     """Regresa TODOS los paquetes que ahorita mismo están físicamente en
     algún bin de la bodega (SORTER/PEN/ESTIBA/etc.) y todavía no se
     despachan — sin importar su fecha límite de despacho. Fuente de datos
-    de la sección "Por ubicación"."""
+    de la sección "Por ubicación".
+
+    pais: ver get_shipping_data()."""
 
     conn = _conexion()
     try:
+        warehouse_ids = _warehouse_ids_por_pais(conn, pais)
         df = pd.read_sql(_QUERY_UBICACIONES, conn, params={
             "estados_sin_despachar": ESTADOS_SIN_DESPACHAR,
+            "pais": pais,
+            "warehouse_ids": warehouse_ids,
         })
     finally:
         conn.close()
