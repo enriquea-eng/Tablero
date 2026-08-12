@@ -39,6 +39,20 @@ regresa un DataFrame con estas columnas, que es lo único que espera app.py:
     fecha_salida         -> fecha de la promesa de despacho (ship_promise_max)
     hora_creacion        -> sell_order.creation_date
     hora_limite           -> ship_promise_max del intento vigente (SLA)
+    hora_limite_externa   -> solo para órdenes con promise_source='EXTERNAL'
+                            en sell_order_promise_info (confirmado con
+                            Julián): la fecha límite REAL que ve el
+                            vendedor/marketplace, que puede ser muy distinta
+                            a hora_limite (ej. orden M1786480139616820:
+                            hora_limite decía "vencida hoy 18:00", la
+                            promesa externa real era "mañana 07:15"). None
+                            si la orden no es EXTERNAL o si es EXTERNAL pero
+                            no tiene el dato capturado (histórico
+                            incompleto) — en ambos casos app.py usa
+                            hora_limite como respaldo. Solo se usa para el
+                            cálculo de "vencidas"; el resto del tablero
+                            (urgentes, despachadas tarde, hora_limite que se
+                            muestra en las tablas) sigue usando hora_limite.
     hora_despacho          -> ship_timestamp del intento vigente. None si
                             todavía no se ha despachado.
     hora_creacion_hora_local -> hora del día (0-23) de hora_creacion ya en
@@ -334,7 +348,10 @@ _QUERY_BASE = """
         so.creation_date                AS hora_creacion,
         wb.name                          AS ubicacion_fisica,
         dr.internal_route_number        AS ruta_numero,
-        dr.delivery_route_type_id       AS ruta_tipo_id
+        dr.delivery_route_type_id       AS ruta_tipo_id,
+        spi.promise_source              AS promise_source,
+        JSON_UNQUOTE(JSON_EXTRACT(spi.external_promise_info, '$.promise_value.max'))
+                                         AS hora_limite_externa
     FROM sell_order so
     JOIN sell_order_attempt soa
         ON soa.sell_order_id = so.id
@@ -368,6 +385,8 @@ _QUERY_BASE = """
         ON cc.id = ts.courier_company_id
     LEFT JOIN delivery_route dr
         ON dr.id = soa.delivery_route_id
+    LEFT JOIN sell_order_promise_info spi
+        ON spi.sell_order_id = so.id
     WHERE so.sell_order_state_id IN %(estados)s
       AND so.creation_date >= CURDATE() - INTERVAL {dias_atras} DAY
       AND {columna_fecha} >= CURDATE() - INTERVAL 1 DAY
@@ -518,13 +537,24 @@ def get_shipping_data(pais=None) -> pd.DataFrame:
     # toda la columna queda en object y rompe el accessor .dt más abajo. Se
     # fuerza el cast explícito por columna (mismo patrón que en
     # get_ordenes_pickup()).
-    for col in ("hora_creacion", "hora_limite", "hora_despacho"):
+    for col in ("hora_creacion", "hora_limite", "hora_despacho", "hora_limite_externa"):
         df[col] = pd.to_datetime(df[col])
 
     # Sin bodega asignada no hay zona horaria con la cual ubicar "hoy" localmente.
     df = df.dropna(subset=["zona_horaria"]).copy()
-    df = _localizar_por_zona(df, ["hora_creacion", "hora_limite", "hora_despacho"])
+    df = _localizar_por_zona(df, ["hora_creacion", "hora_limite", "hora_despacho", "hora_limite_externa"])
     df = df[_es_hoy_local(df)].copy()
+
+    # sell_order_promise_info.external_promise_info solo es confiable cuando
+    # promise_source='EXTERNAL' (confirmado con Julián): ahí la promesa real
+    # que ve el vendedor/marketplace puede ser MUY distinta a ship_promise_max
+    # (ej. orden M1786480139616820: interno decía vencida hoy 18:00, la
+    # promesa externa real era mañana 07:15) — por eso "vencida" debe
+    # evaluarse con esta promesa en vez de la interna para estas órdenes. Si
+    # promise_source no es 'EXTERNAL', o la orden no tiene promesa externa
+    # capturada (dato histórico incompleto), se deja en NaT para que el
+    # cálculo de vencida en app.py caiga de vuelta a hora_limite normal.
+    df.loc[df["promise_source"] != "EXTERNAL", "hora_limite_externa"] = pd.NaT
 
     df["paquete_id"] = df["orden_numero"].fillna("SO").astype(str) + "-" + df["paquete_id_num"].astype(str)
     df["marketplace_nombre"] = df["ecommerce_platform"].map(
@@ -545,8 +575,8 @@ def get_shipping_data(pais=None) -> pd.DataFrame:
     columnas = [
         "paquete_id", "orden_id", "pais", "cedi", "metodo_envio", "marketplace_nombre",
         "seller", "transportadora", "ubicacion", "ubicacion_fisica", "fecha_salida",
-        "hora_creacion", "hora_limite", "hora_despacho", "hora_creacion_hora_local",
-        "ruta_numero", "ruta_tipo_id",
+        "hora_creacion", "hora_limite", "hora_limite_externa", "hora_despacho",
+        "hora_creacion_hora_local", "ruta_numero", "ruta_tipo_id",
     ]
     return df[columnas]
 
@@ -829,3 +859,57 @@ def get_ubicaciones_fisicas(pais=None) -> pd.DataFrame:
         "paquete_id", "orden_id", "pais", "cedi", "metodo_envio", "seller",
         "transportadora", "ubicacion_fisica",
     ]]
+
+
+# --- Incidencias sin resolver (sell_order_issue) -------------------------
+#
+# NOTA DE RENDIMIENTO: sell_order_issue tiene ~3M filas. En vez de meter esto
+# como un JOIN agregado más dentro de _QUERY_BASE (que tendría que agregar
+# sobre TODA la tabla de incidencias sin resolver, ~1.5M filas, para armar
+# un solo resultado por orden — mismo patrón que sowl_ultima pero a una
+# escala mucho mayor), se consulta aparte, filtrando directo por los
+# orden_id que ya se obtuvieron de get_shipping_data() (una lista acotada,
+# normalmente unas decenas/cientos de órdenes vencidas, no millones) usando
+# el índice compuesto (sell_order_id, resolved). Una orden puede tener más
+# de una incidencia sin resolver a la vez — se regresa una fila por
+# incidencia, no una por orden.
+def get_incidencias_abiertas(orden_ids) -> pd.DataFrame:
+    """Regresa las incidencias SIN RESOLVER (sell_order_issue.resolved = 0)
+    de los orden_id dados — pensado para cruzarse con órdenes vencidas y
+    mostrar cuáles tienen una incidencia (ej. dirección incorrecta) que
+    explica por qué siguen atoradas.
+
+    fecha_reporte/promesa_solucion quedan tal como las regresa MySQL (hora
+    del servidor, UTC) sin convertir a hora local de bodega — a diferencia
+    de hora_limite/hora_despacho en get_shipping_data(), esta tabla es solo
+    de referencia y no entra en ningún cálculo de vencida/urgente."""
+    orden_ids = tuple(int(x) for x in pd.Series(list(orden_ids)).dropna().unique())
+    columnas = [
+        "orden_id", "tipo_incidencia", "reportado_por", "fecha_reporte",
+        "comentario", "promesa_solucion",
+    ]
+    if not orden_ids:
+        return pd.DataFrame(columns=columnas)
+
+    conn = _conexion()
+    try:
+        df = pd.read_sql(
+            """
+            SELECT
+                soi.sell_order_id             AS orden_id,
+                sit.name                      AS tipo_incidencia,
+                soi.reported_by               AS reportado_por,
+                soi.report_date               AS fecha_reporte,
+                soi.report_comments           AS comentario,
+                soi.max_solution_promise_date AS promesa_solucion
+            FROM sell_order_issue soi
+            LEFT JOIN sell_order_issue_type sit
+                ON sit.id = soi.sell_order_issue_type_id
+            WHERE soi.resolved = 0
+              AND soi.sell_order_id IN %(orden_ids)s
+            """,
+            conn, params={"orden_ids": orden_ids},
+        )
+    finally:
+        conn.close()
+    return df[columnas]

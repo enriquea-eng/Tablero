@@ -1,5 +1,4 @@
 import streamlit as st
-import streamlit.components.v1 as components
 import plotly.express as px
 import pandas as pd
 import io
@@ -7,7 +6,7 @@ import html as html_lib
 from datetime import datetime, date, timedelta, timezone
 from data import (
     get_shipping_data, get_entradas_por_hora, get_ordenes_pickup, get_ubicaciones_fisicas,
-    ID_TIPO_RUTA_MENSAJEROS,
+    get_incidencias_abiertas, ID_TIPO_RUTA_MENSAJEROS,
 )
 
 st.set_page_config(page_title="Tablero de Envíos", layout="wide")
@@ -49,7 +48,7 @@ def render_reporte_imprimible(cuerpo_html, altura=650):
     </body>
     </html>
     """
-    components.html(documento, height=altura, scrolling=True)
+    st.iframe(documento, height=altura)
 
 
 def tabla_conteo_html(serie, nombre_columna):
@@ -77,7 +76,7 @@ def tabla_ordenes_paquetes_html(df, columna, nombre_columna):
     "Paquetes"."""
     resumen = df.groupby(columna).agg(
         ordenes=("orden_id", "nunique"), paquetes=("paquete_id", "count")
-    )
+    ).sort_values("ordenes", ascending=False)
     filas_html = "".join(
         f"<tr><td>{html_lib.escape(str(idx))}</td><td>{fila.ordenes}</td><td>{fila.paquetes}</td></tr>"
         for idx, fila in resumen.iterrows()
@@ -175,7 +174,7 @@ def barra_horizontal(serie, color="#7C4DFF"):
         paper_bgcolor="rgba(0,0,0,0)",
     )
     fig.update_yaxes(tickfont=dict(size=14))
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
 
 if "data" not in st.session_state:
     with st.spinner("Cargando datos..."):
@@ -211,7 +210,7 @@ with col_fecha:
 
 with col_boton:
     st.write("")  # separación vertical
-    if st.button("🔄 Actualizar todo", use_container_width=True):
+    if st.button("🔄 Actualizar todo", width="stretch"):
         # Sin más código después de esto (nada de st.rerun()): un clic de
         # botón ya provoca su propia vuelta completa del script. Si se corta
         # la ejecución aquí con st.rerun(), el script nunca llega a crear los
@@ -284,7 +283,7 @@ seller_sel = f3.selectbox("Seller", sellers, key="filtro_seller")
 
 with f4:
     st.write("")
-    st.button("✕ Limpiar filtros", use_container_width=True, on_click=limpiar_filtros)
+    st.button("✕ Limpiar filtros", width="stretch", on_click=limpiar_filtros)
 
 # --- Actualizar solo el país seleccionado (más rápido que "Actualizar
 # todo" porque el filtro de país va directo en el SQL, no solo en Python —
@@ -293,7 +292,7 @@ with f4:
 # quedan tal como estaban (pueden quedar desactualizados hasta su propio
 # refresh o hasta el próximo "Actualizar todo"). ---
 if pais_sel != "Todos":
-    if st.button(f"⚡ Actualizar solo {pais_sel}", use_container_width=True):
+    if st.button(f"⚡ Actualizar solo {pais_sel}", width="stretch"):
         with st.spinner(f"Actualizando solo {pais_sel}..."):
             nuevo_data = get_shipping_data(pais=pais_sel)
             nuevo_entradas = get_entradas_por_hora(pais=pais_sel)
@@ -363,7 +362,18 @@ total_pendientes = len(pendientes)
 pct_despachadas = (total_despachadas / total_programadas * 100) if total_programadas else 0
 pct_pendientes = 100 - pct_despachadas if total_programadas else 0
 
-vencidas = pendientes[pendientes["hora_limite"] < ahora].copy()
+# Para órdenes con promesa EXTERNA (promise_source='EXTERNAL' en
+# sell_order_promise_info), la fecha límite real que ve el vendedor/
+# marketplace puede ser muy distinta a ship_promise_max (confirmado con
+# Julián con la orden M1786480139616820: interno marcaba vencida hoy 18:00,
+# la promesa externa real era mañana 07:15) — por eso "vencida" se evalúa
+# con hora_limite_externa cuando existe, y con hora_limite normal si no
+# (la mayoría de las órdenes, y las EXTERNAL sin dato capturado). Solo
+# afecta esta sección: urgentes/despachadas_tarde siguen usando hora_limite.
+limite_vencida = pendientes["hora_limite_externa"].where(
+    pendientes["hora_limite_externa"].notna(), pendientes["hora_limite"]
+)
+vencidas = pendientes[limite_vencida < ahora].copy()
 urgentes = pendientes[
     (pendientes["hora_limite"] >= ahora) & (pendientes["hora_limite"] <= ahora + ventana_urgente)
 ].copy()
@@ -391,19 +401,49 @@ incumplidas = _formatear_horas_locales(incumplidas)
 st.header("🔔 Alertas")
 
 columnas_alerta = [
-    "paquete_id", "cedi", "seller", "metodo_envio", "transportadora", "ubicacion", "ubicacion_fisica", "hora_limite",
+    "paquete_id", "cedi", "seller", "metodo_envio", "transportadora", "ubicacion_fisica", "hora_limite",
 ]
 
 if len(vencidas) > 0:
-    st.error(f"🚨 {len(vencidas)} órdenes VENCIDAS: ya debieron salir y siguen sin despachar")
-    with st.expander("Ver órdenes vencidas", expanded=True):
-        st.dataframe(vencidas[columnas_alerta], use_container_width=True)
+    # Cruza las vencidas con sell_order_issue (incidencias sin resolver, ej.
+    # dirección incorrecta) para separar las que están atoradas por una
+    # incidencia de las que no — cada orden aparece en una sola de las dos
+    # tablas de abajo, nunca en ambas. La alerta roja de arriba cuenta solo
+    # las que NO tienen incidencia (las que de verdad no tienen explicación
+    # todavía), para que no diga "N vencidas" con la tabla vacía cuando
+    # todas están explicadas por una incidencia.
+    incidencias_vencidas = get_incidencias_abiertas(vencidas["orden_id"].unique())
+    tiene_incidencia = vencidas["orden_id"].isin(incidencias_vencidas["orden_id"])
+    vencidas_sin_incidencia = vencidas[~tiene_incidencia]
+
+    if len(vencidas_sin_incidencia) > 0:
+        st.error(
+            f"🚨 {len(vencidas_sin_incidencia)} órdenes VENCIDAS: ya debieron salir y siguen sin despachar"
+        )
+        with st.expander("Ver órdenes vencidas", expanded=True):
+            st.dataframe(vencidas_sin_incidencia[columnas_alerta], width="stretch")
+
+    if len(incidencias_vencidas) > 0:
+        vencidas_con_incidencia = vencidas[tiene_incidencia].merge(
+            incidencias_vencidas, on="orden_id", how="inner"
+        )
+        st.warning(
+            f"🔧 {vencidas_con_incidencia['paquete_id'].nunique()} de las vencidas tienen una "
+            "incidencia sin resolver"
+        )
+        with st.expander("Ver vencidas con incidencia sin resolver", expanded=True):
+            st.dataframe(
+                vencidas_con_incidencia[columnas_alerta + [
+                    "tipo_incidencia", "reportado_por", "fecha_reporte", "comentario", "promesa_solucion",
+                ]],
+                width="stretch",
+            )
 
 if len(urgentes) > 0:
     horas_ventana = int(ventana_urgente.total_seconds() // 3600)
     st.warning(f"⚠️ {len(urgentes)} órdenes deben salir sí o sí en las próximas {horas_ventana} horas")
     with st.expander("Ver órdenes urgentes", expanded=True):
-        st.dataframe(urgentes[columnas_alerta], use_container_width=True)
+        st.dataframe(urgentes[columnas_alerta], width="stretch")
 
 if len(vencidas) == 0 and len(urgentes) == 0:
     st.success("✅ Sin alertas: no hay órdenes vencidas ni próximas a vencer")
@@ -529,7 +569,7 @@ if len(datos_horas) > 0:
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
     )
-    st.plotly_chart(fig_horas, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(fig_horas, width="stretch", config={"displayModeBar": False})
 
 columnas_entradas_detalle = [
     "orden_numero", "pais", "cedi", "seller", "metodo_envio", "estado", "hora_creacion",
@@ -540,12 +580,12 @@ siguiente_dia_detalle = _formatear_horas_locales(siguiente_dia_todas, columnas=(
 with st.expander(f"Ver detalle — Mismo día ({len(mismo_dia_detalle)})"):
     st.dataframe(
         mismo_dia_detalle[columnas_entradas_detalle].sort_values("hora_creacion"),
-        use_container_width=True,
+        width="stretch",
     )
 with st.expander(f"Ver detalle — Siguiente día ({len(siguiente_dia_detalle)})"):
     st.dataframe(
         siguiente_dia_detalle[columnas_entradas_detalle].sort_values("hora_creacion"),
-        use_container_width=True,
+        width="stretch",
     )
 
 st.divider()
@@ -578,11 +618,11 @@ def _metricas_ubicacion(base_df, etiqueta):
     u3.metric(f"Estiba sin transportadora ({etiqueta})", len(en_estiba))
     with st.expander(f"Ver detalle — {etiqueta}"):
         st.write("**SORTER**")
-        st.dataframe(sorting[columnas_ubicacion], use_container_width=True)
+        st.dataframe(sorting[columnas_ubicacion], width="stretch")
         st.write("**Pendiente (sin transportadora)**")
-        st.dataframe(en_pendiente[columnas_ubicacion], use_container_width=True)
+        st.dataframe(en_pendiente[columnas_ubicacion], width="stretch")
         st.write("**Estiba (sin transportadora)**")
-        st.dataframe(en_estiba[columnas_ubicacion], use_container_width=True)
+        st.dataframe(en_estiba[columnas_ubicacion], width="stretch")
 
 
 # ubicaciones_filtrado trae TODO lo que está físicamente en la bodega ahora
@@ -607,7 +647,10 @@ st.divider()
 # DETALLE COMPLETO DE PENDIENTES
 # =========================================================
 with st.expander("Ver detalle completo de órdenes por despachar"):
-    st.dataframe(pendientes, use_container_width=True)
+    st.dataframe(
+        pendientes.drop(columns=["ubicacion", "hora_limite_externa"]),
+        width="stretch",
+    )
 
 st.divider()
 
@@ -621,9 +664,9 @@ st.metric("Total de órdenes incumplidas", len(incumplidas))
 if len(incumplidas) > 0:
     columnas_incumplidas = [
         "paquete_id", "cedi", "seller", "metodo_envio", "transportadora",
-        "ubicacion", "ubicacion_fisica", "hora_limite", "hora_despacho", "motivo",
+        "ubicacion_fisica", "hora_limite", "hora_despacho", "motivo",
     ]
-    st.dataframe(incumplidas[columnas_incumplidas], use_container_width=True)
+    st.dataframe(incumplidas[columnas_incumplidas], width="stretch")
 else:
     st.success("No hay órdenes incumplidas por ahora 🎉")
 
@@ -679,12 +722,12 @@ if len(vencidas_pickup) > 0:
         "recogida y el cliente no ha pasado por ellas — deben cancelarse por espacio."
     )
     with st.expander("Ver órdenes pickup vencidas (+15 días)", expanded=True):
-        st.dataframe(vencidas_pickup[columnas_pickup_orden], use_container_width=True)
+        st.dataframe(vencidas_pickup[columnas_pickup_orden], width="stretch")
 else:
     st.success("✅ Ninguna orden pickup lleva más de 15 días esperando.")
 
 with st.expander(f"Ver todas las órdenes pickup pendientes ({len(pickup_ordenes)})"):
-    st.dataframe(pickup_ordenes[columnas_pickup_orden], use_container_width=True)
+    st.dataframe(pickup_ordenes[columnas_pickup_orden], width="stretch")
 
 pickup_excel_buffer = io.BytesIO()
 with pd.ExcelWriter(pickup_excel_buffer, engine="openpyxl") as writer:
@@ -746,7 +789,7 @@ st.divider()
 st.header("🚫 Vencidas")
 
 columnas_vencidas = [
-    "paquete_id", "cedi", "seller", "metodo_envio", "transportadora", "ubicacion", "ubicacion_fisica", "hora_limite",
+    "paquete_id", "cedi", "seller", "metodo_envio", "transportadora", "ubicacion_fisica", "hora_limite",
 ]
 
 st.download_button(
